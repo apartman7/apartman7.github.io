@@ -70,7 +70,7 @@ function loadIdempotency({ localStorage, requestIds, locks = memoryLocks(), sess
   };
   vm.runInNewContext(
     `const INVOICE_SOURCE_SITE='test.example';function createInvoiceRequestId(){return globalThis.nextRequestId()}\n${source}\n` +
-      "globalThis.__api={createInvoicePayloadFingerprint,getOrCreateInvoiceRequestId,clearInvoiceRequestId,readPendingInvoiceRequest_,pendingInvoiceStorageKey_,INVOICE_LEGACY_PENDING_STORAGE_KEY};",
+      "globalThis.__api={createInvoicePayloadFingerprint,getOrCreateInvoiceRequestId,readPendingInvoiceRequest_,pendingInvoiceStorageKey_,INVOICE_LEGACY_PENDING_STORAGE_KEY};",
     sandbox,
   );
   return { api: sandbox.__api, field, get requestIdCalls() { return requestIdCalls; } };
@@ -97,18 +97,18 @@ test("iframe transport accepts only a matching Google ACK", () => {
   assert.doesNotMatch(html, /REPLACE_WITH_PUBLIC_INTAKE_DEPLOYMENT_ID/);
 });
 
-test("request id is awaited and cleared only after a positive ACK", () => {
+test("request id is awaited and its 24-hour marker remains after a positive ACK", () => {
   const prepareIndex = html.indexOf("await getOrCreateInvoiceRequestId(payloadFingerprint)");
   const ackIndex = html.indexOf("await postInvoiceRequest(data)", prepareIndex);
-  const clearIndex = html.indexOf("await clearInvoiceRequestId(requestId,payloadFingerprint)", ackIndex);
-  assert.ok(prepareIndex >= 0 && ackIndex > prepareIndex && clearIndex > ackIndex);
-  assert.equal((html.match(/clearInvoiceRequestId\(requestId,payloadFingerprint\)/g) || []).length, 1);
+  const resetIndex = html.indexOf("e.target.reset()", ackIndex);
+  assert.ok(prepareIndex >= 0 && ackIndex > prepareIndex && resetIndex > ackIndex);
+  assert.doesNotMatch(html, /clearInvoiceRequestId/);
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
   assert.ok(scripts.length > 0);
   for (const source of scripts) new Function(source);
 });
 
-test("close and reopen reuses the id, changed payload gets a new per-fingerprint record, and stale ACK is isolated", async () => {
+test("close and reopen reuses the id, changed payload is isolated, and ACK retains the id for 24 hours", async () => {
   const localStorage = memoryStorage();
   const locks = memoryLocks();
   const ids = [
@@ -136,19 +136,20 @@ test("close and reopen reuses the id, changed payload gets a new per-fingerprint
   assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(fingerprint)));
   assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)));
 
-  await reopened.api.clearInvoiceRequestId(firstId, fingerprint, now + 3);
-  assert.equal(reopened.field.value, changedId, "stale ACK A must not clear field or marker B");
-  assert.equal(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(fingerprint)), null);
-  assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)));
-
-  await reopened.api.clearInvoiceRequestId(changedId, changedFingerprint, now + 4);
-  assert.equal(reopened.field.value, "");
-  assert.equal(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)), null);
+  reopened.field.value = ""; // positive ACK resets the form, not the persistent dedupe marker
   const afterAck = loadIdempotency({ localStorage, locks, requestIds: ids.slice(2) });
-  assert.equal(await afterAck.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 5), ids[2]);
+  assert.equal(await afterAck.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 5), changedId);
+  assert.equal(afterAck.requestIdCalls, 0, "positive ACK must not open a duplicate retry window");
+
+  const afterTtl = loadIdempotency({ localStorage, locks, requestIds: ids.slice(2) });
+  assert.equal(
+    await afterTtl.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 24 * 60 * 60 * 1000 + 3),
+    ids[2],
+    "an identical legitimate request may receive a new id after the 24-hour window",
+  );
 });
 
-test("simultaneous first submission in two tabs creates one id and both tabs reuse it", async () => {
+test("two tabs plus one positive ACK and one lost ACK still reuse exactly one id", async () => {
   const localStorage = memoryStorage();
   const locks = memoryLocks();
   const first = loadIdempotency({
@@ -164,6 +165,17 @@ test("simultaneous first submission in two tabs creates one id and both tabs reu
   ]);
   assert.equal(firstId, secondId);
   assert.equal(first.requestIdCalls + second.requestIdCalls, 1);
+
+  first.field.value = ""; // tab A gets ACK and resets; tab B times out
+  const retry = loadIdempotency({
+    localStorage, locks, requestIds: ["web-cccccccccccccccccccccccccccccccc"],
+  });
+  assert.equal(
+    await retry.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000001),
+    firstId,
+    "tab B retry must keep the original id after tab A received ACK",
+  );
+  assert.equal(retry.requestIdCalls, 0);
 });
 
 test("stored pending marker contains no guest PII", async () => {
@@ -215,7 +227,48 @@ test("missing Web Locks support fails before storage or request id generation", 
   assert.equal(localStorage.getItem(instance.api.pendingInvoiceStorageKey_(fingerprint)), null);
 });
 
-test("matching legacy v1 marker migrates without generating a new id", async () => {
+test("expired marker cleanup fails closed if confirmed removal is unavailable", async () => {
+  const localStorage = memoryStorage({ rejectRemoves: true });
+  const instance = loadIdempotency({
+    localStorage,
+    requestIds: ["web-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
+  });
+  const fingerprint = await instance.api.createInvoicePayloadFingerprint({ guest_name: "Expired", request_id: "" });
+  localStorage.setItem(instance.api.pendingInvoiceStorageKey_(fingerprint), JSON.stringify({
+    version: 2,
+    requestId: "web-77777777777777777777777777777777",
+    fingerprint,
+    expiresAt: 1899999999999,
+  }));
+  await assert.rejects(
+    instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+    /storage blocked/,
+  );
+  assert.equal(instance.requestIdCalls, 0);
+});
+
++test("expired legacy marker is ignored without deleting the shared v1 key", async () => {
+  const localStorage = memoryStorage();
+  const instance = loadIdempotency({
+    localStorage,
+    requestIds: ["web-66666666666666666666666666666666"],
+  });
+  const fingerprint = await instance.api.createInvoicePayloadFingerprint({ guest_name: "Old legacy", request_id: "" });
+  const legacyRaw = JSON.stringify({
+    version: 1,
+    requestId: "web-55555555555555555555555555555555",
+    fingerprint,
+    expiresAt: 1899999999999,
+  });
+  localStorage.setItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY, legacyRaw);
+  assert.equal(
+    await instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+    "web-66666666666666666666666666666666",
+  );
+  assert.equal(localStorage.getItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY), legacyRaw);
+});
+
++test("matching legacy v1 marker copies to v2 without generating a new id or racing its deletion", async () => {
   const localStorage = memoryStorage();
   const instance = loadIdempotency({
     localStorage,
@@ -231,7 +284,7 @@ test("matching legacy v1 marker migrates without generating a new id", async () 
   }));
   assert.equal(await instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000), legacyId);
   assert.equal(instance.requestIdCalls, 0);
-  assert.equal(localStorage.getItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY), null);
+  assert.ok(localStorage.getItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY));
   const migrated = JSON.parse(localStorage.getItem(instance.api.pendingInvoiceStorageKey_(fingerprint)));
   assert.equal(migrated.version, 2);
   assert.equal(migrated.requestId, legacyId);
