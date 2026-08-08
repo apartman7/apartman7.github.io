@@ -247,7 +247,7 @@ test("expired marker cleanup fails closed if confirmed removal is unavailable", 
   assert.equal(instance.requestIdCalls, 0);
 });
 
-+test("expired legacy marker is ignored without deleting the shared v1 key", async () => {
+test("expired legacy marker is ignored without deleting the shared v1 key", async () => {
   const localStorage = memoryStorage();
   const instance = loadIdempotency({
     localStorage,
@@ -268,7 +268,7 @@ test("expired marker cleanup fails closed if confirmed removal is unavailable", 
   assert.equal(localStorage.getItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY), legacyRaw);
 });
 
-+test("matching legacy v1 marker copies to v2 without generating a new id or racing its deletion", async () => {
+test("matching legacy v1 marker copies to v2 without generating a new id or racing its deletion", async () => {
   const localStorage = memoryStorage();
   const instance = loadIdempotency({
     localStorage,
