@@ -8,19 +8,41 @@ const html = fs.readFileSync(new URL("../index.html", import.meta.url), "utf8");
 const IDEMPOTENCY_START = "/* invoice-idempotency:start */";
 const IDEMPOTENCY_END = "/* invoice-idempotency:end */";
 
-function memoryStorage({ rejectWrites = false } = {}) {
+function memoryStorage({ rejectReads = false, rejectWrites = false, rejectRemoves = false } = {}) {
   const values = new Map();
   return {
-    getItem(key) { return values.has(key) ? values.get(key) : null; },
+    getItem(key) {
+      if (rejectReads) throw new Error("storage blocked");
+      return values.has(key) ? values.get(key) : null;
+    },
     setItem(key, value) {
       if (rejectWrites) throw new Error("storage blocked");
       values.set(key, String(value));
     },
-    removeItem(key) { values.delete(key); },
+    removeItem(key) {
+      if (rejectRemoves) throw new Error("storage blocked");
+      values.delete(key);
+    },
   };
 }
 
-function loadIdempotency({ sessionStorage, localStorage, requestIds }) {
+function memoryLocks() {
+  const tails = new Map();
+  return {
+    request(name, options, callback) {
+      assert.equal(options.mode, "exclusive");
+      const prior = tails.get(name) || Promise.resolve();
+      const run = prior.catch(() => {}).then(() => callback());
+      const tail = run.then(() => undefined, () => undefined);
+      tails.set(name, tail);
+      return run.finally(() => {
+        if (tails.get(name) === tail) tails.delete(name);
+      });
+    },
+  };
+}
+
+function loadIdempotency({ localStorage, requestIds, locks = memoryLocks(), sessionStorage = memoryStorage() }) {
   const start = html.indexOf(IDEMPOTENCY_START);
   const end = html.indexOf(IDEMPOTENCY_END, start);
   assert.ok(start >= 0 && end > start, "missing idempotency source markers");
@@ -30,8 +52,9 @@ function loadIdempotency({ sessionStorage, localStorage, requestIds }) {
   const sandbox = {
     crypto: webcrypto,
     TextEncoder,
-    sessionStorage,
     localStorage,
+    sessionStorage,
+    navigator: locks === null ? {} : { locks },
     document: {
       getElementById(id) {
         assert.equal(id, "invoiceRequestId");
@@ -47,7 +70,7 @@ function loadIdempotency({ sessionStorage, localStorage, requestIds }) {
   };
   vm.runInNewContext(
     `const INVOICE_SOURCE_SITE='test.example';function createInvoiceRequestId(){return globalThis.nextRequestId()}\n${source}\n` +
-      "globalThis.__api={createInvoicePayloadFingerprint,getOrCreateInvoiceRequestId,clearInvoiceRequestId,readPendingInvoiceRequest_};",
+      "globalThis.__api={createInvoicePayloadFingerprint,getOrCreateInvoiceRequestId,clearInvoiceRequestId,readPendingInvoiceRequest_,pendingInvoiceStorageKey_,INVOICE_LEGACY_PENDING_STORAGE_KEY};",
     sandbox,
   );
   return { api: sandbox.__api, field, get requestIdCalls() { return requestIdCalls; } };
@@ -74,82 +97,142 @@ test("iframe transport accepts only a matching Google ACK", () => {
   assert.doesNotMatch(html, /REPLACE_WITH_PUBLIC_INTAKE_DEPLOYMENT_ID/);
 });
 
-test("request id and pending fingerprint are cleared only after positive ACK", () => {
-  const awaitIndex = html.indexOf("await postInvoiceRequest(data)");
-  const clearIndex = html.indexOf("clearInvoiceRequestId(requestId,payloadFingerprint)", awaitIndex);
-  assert.ok(awaitIndex >= 0 && clearIndex > awaitIndex);
+test("request id is awaited and cleared only after a positive ACK", () => {
+  const prepareIndex = html.indexOf("await getOrCreateInvoiceRequestId(payloadFingerprint)");
+  const ackIndex = html.indexOf("await postInvoiceRequest(data)", prepareIndex);
+  const clearIndex = html.indexOf("await clearInvoiceRequestId(requestId,payloadFingerprint)", ackIndex);
+  assert.ok(prepareIndex >= 0 && ackIndex > prepareIndex && clearIndex > ackIndex);
   assert.equal((html.match(/clearInvoiceRequestId\(requestId,payloadFingerprint\)/g) || []).length, 1);
   const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
   assert.ok(scripts.length > 0);
   for (const source of scripts) new Function(source);
 });
 
-test("identical payload reuses request id after reload, changed payload gets a new id, ACK clears it", async () => {
-  const sessionStorage = memoryStorage();
+test("close and reopen reuses the id, changed payload gets a new per-fingerprint record, and stale ACK is isolated", async () => {
   const localStorage = memoryStorage();
+  const locks = memoryLocks();
   const ids = [
     "web-11111111111111111111111111111111",
     "web-22222222222222222222222222222222",
     "web-33333333333333333333333333333333",
   ];
   const now = 1900000000000;
-  const first = loadIdempotency({ sessionStorage, localStorage, requestIds: ids });
+  const first = loadIdempotency({ localStorage, locks, requestIds: ids });
   const payload = { guest_email: "host@example.com", guest_name: "Test", request_id: "" };
   const fingerprint = await first.api.createInvoicePayloadFingerprint(payload);
-  const reordered = await first.api.createInvoicePayloadFingerprint({ request_id: "ignored", guest_name: "Test", guest_email: "host@example.com" });
-  assert.equal(fingerprint, reordered, "request_id and key order must not change the fingerprint");
-  const firstId = first.api.getOrCreateInvoiceRequestId(fingerprint, now);
+  const reordered = await first.api.createInvoicePayloadFingerprint({ ack_nonce: "ignored", request_id: "ignored", guest_name: "Test", guest_email: "host@example.com" });
+  assert.equal(fingerprint, reordered, "volatile transport fields and key order must not change the fingerprint");
+  const firstId = await first.api.getOrCreateInvoiceRequestId(fingerprint, now);
   assert.equal(firstId, ids[0]);
   assert.equal(first.requestIdCalls, 1);
 
-  const reload = loadIdempotency({ sessionStorage: memoryStorage(), localStorage, requestIds: ids.slice(1) });
-  assert.equal(reload.api.getOrCreateInvoiceRequestId(fingerprint, now + 1), firstId);
-  assert.equal(reload.requestIdCalls, 0, "reload must not generate another id for the same payload");
+  const reopened = loadIdempotency({ localStorage, locks, requestIds: ids.slice(1) });
+  assert.equal(await reopened.api.getOrCreateInvoiceRequestId(fingerprint, now + 1), firstId);
+  assert.equal(reopened.requestIdCalls, 0, "reopened page must not generate another id");
 
-  const changedFingerprint = await reload.api.createInvoicePayloadFingerprint({ ...payload, guest_name: "Changed" });
-  const changedId = reload.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 2);
+  const changedFingerprint = await reopened.api.createInvoicePayloadFingerprint({ ...payload, guest_name: "Changed" });
+  const changedId = await reopened.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 2);
   assert.equal(changedId, ids[1]);
-  reload.api.clearInvoiceRequestId(firstId, fingerprint, now + 3);
-  assert.equal(reload.field.value, changedId, "stale ACK must not clear a newer pending request");
-  assert.ok(localStorage.getItem("booking-invoice-pending-v1:test.example"));
+  assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(fingerprint)));
+  assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)));
 
-  reload.api.clearInvoiceRequestId(changedId, changedFingerprint, now + 4);
-  assert.equal(reload.field.value, "");
-  assert.equal(localStorage.getItem("booking-invoice-pending-v1:test.example"), null);
-  const afterAck = loadIdempotency({ sessionStorage: memoryStorage(), localStorage, requestIds: ids.slice(2) });
-  assert.equal(afterAck.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 5), ids[2]);
+  await reopened.api.clearInvoiceRequestId(firstId, fingerprint, now + 3);
+  assert.equal(reopened.field.value, changedId, "stale ACK A must not clear field or marker B");
+  assert.equal(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(fingerprint)), null);
+  assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)));
+
+  await reopened.api.clearInvoiceRequestId(changedId, changedFingerprint, now + 4);
+  assert.equal(reopened.field.value, "");
+  assert.equal(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(changedFingerprint)), null);
+  const afterAck = loadIdempotency({ localStorage, locks, requestIds: ids.slice(2) });
+  assert.equal(await afterAck.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 5), ids[2]);
 });
 
-test("blocked localStorage falls back to reload-safe sessionStorage without storing PII", async () => {
-  const blockedLocal = memoryStorage({ rejectWrites: true });
-  const sessionStorage = memoryStorage();
-  const ids = ["web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "web-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"];
-  const first = loadIdempotency({ sessionStorage, localStorage: blockedLocal, requestIds: ids });
+test("simultaneous first submission in two tabs creates one id and both tabs reuse it", async () => {
+  const localStorage = memoryStorage();
+  const locks = memoryLocks();
+  const first = loadIdempotency({
+    localStorage, locks, requestIds: ["web-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  });
+  const second = loadIdempotency({
+    localStorage, locks, requestIds: ["web-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+  });
+  const fingerprint = await first.api.createInvoicePayloadFingerprint({ guest_name: "Concurrent", request_id: "" });
+  const [firstId, secondId] = await Promise.all([
+    first.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+    second.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+  ]);
+  assert.equal(firstId, secondId);
+  assert.equal(first.requestIdCalls + second.requestIdCalls, 1);
+});
+
+test("stored pending marker contains no guest PII", async () => {
+  const localStorage = memoryStorage();
+  const instance = loadIdempotency({
+    localStorage,
+    requestIds: ["web-cccccccccccccccccccccccccccccccc"],
+  });
   const payload = { guest_name: "Sensitive Guest", guest_email: "sensitive@example.com", request_id: "" };
-  const fingerprint = await first.api.createInvoicePayloadFingerprint(payload);
-  const requestId = first.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000);
-  const stored = sessionStorage.getItem("booking-invoice-pending-v1:test.example");
+  const fingerprint = await instance.api.createInvoicePayloadFingerprint(payload);
+  await instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000);
+  const stored = localStorage.getItem(instance.api.pendingInvoiceStorageKey_(fingerprint));
   assert.ok(stored);
   assert.doesNotMatch(stored, /Sensitive Guest|sensitive@example\.com/);
-
-  const reload = loadIdempotency({ sessionStorage, localStorage: blockedLocal, requestIds: ids.slice(1) });
-  assert.equal(reload.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000001), requestId);
-  assert.equal(reload.requestIdCalls, 0);
 });
 
-test("request preparation fails closed when no persistent storage accepts the pending id", async () => {
-  const blockedSession = memoryStorage({ rejectWrites: true });
-  const blockedLocal = memoryStorage({ rejectWrites: true });
+test("blocked localStorage fails closed even when sessionStorage is available", async () => {
+  const localStorage = memoryStorage({ rejectReads: true, rejectWrites: true });
+  const sessionStorage = memoryStorage();
   const instance = loadIdempotency({
-    sessionStorage: blockedSession,
-    localStorage: blockedLocal,
+    localStorage,
+    sessionStorage,
+    requestIds: ["web-dddddddddddddddddddddddddddddddd"],
+  });
+  const fingerprint = await instance.api.createInvoicePayloadFingerprint({ guest_name: "Test", request_id: "" });
+  await assert.rejects(
+    instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+    /storage blocked|pending-storage-unavailable/,
+  );
+  assert.equal(instance.field.value, "", "failed persistence must not prepare an id for POST");
+  assert.equal(sessionStorage.getItem("booking-invoice-pending-v1:test.example"), null);
+  assert.equal(instance.requestIdCalls, 0);
+});
+
+test("missing Web Locks support fails before storage or request id generation", async () => {
+  const localStorage = memoryStorage();
+  const instance = loadIdempotency({
+    localStorage,
+    locks: null,
     requestIds: ["web-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"],
   });
   const fingerprint = await instance.api.createInvoicePayloadFingerprint({ guest_name: "Test", request_id: "" });
-  assert.throws(
-    () => instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
-    /pending-storage-unavailable/,
+  await assert.rejects(
+    instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000),
+    /pending-lock-unavailable/,
   );
-  assert.equal(instance.field.value, "", "failed persistence must not prepare an id for POST");
-  assert.equal(instance.api.readPendingInvoiceRequest_(1900000000001), null);
+  assert.equal(instance.field.value, "");
+  assert.equal(instance.requestIdCalls, 0);
+  assert.equal(localStorage.getItem(instance.api.pendingInvoiceStorageKey_(fingerprint)), null);
+});
+
+test("matching legacy v1 marker migrates without generating a new id", async () => {
+  const localStorage = memoryStorage();
+  const instance = loadIdempotency({
+    localStorage,
+    requestIds: ["web-ffffffffffffffffffffffffffffffff"],
+  });
+  const fingerprint = await instance.api.createInvoicePayloadFingerprint({ guest_name: "Legacy", request_id: "" });
+  const legacyId = "web-99999999999999999999999999999999";
+  localStorage.setItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY, JSON.stringify({
+    version: 1,
+    requestId: legacyId,
+    fingerprint,
+    expiresAt: 1900000000000 + 60_000,
+  }));
+  assert.equal(await instance.api.getOrCreateInvoiceRequestId(fingerprint, 1900000000000), legacyId);
+  assert.equal(instance.requestIdCalls, 0);
+  assert.equal(localStorage.getItem(instance.api.INVOICE_LEGACY_PENDING_STORAGE_KEY), null);
+  const migrated = JSON.parse(localStorage.getItem(instance.api.pendingInvoiceStorageKey_(fingerprint)));
+  assert.equal(migrated.version, 2);
+  assert.equal(migrated.requestId, legacyId);
 });
