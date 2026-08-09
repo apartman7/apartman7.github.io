@@ -76,14 +76,51 @@ function loadIdempotency({ localStorage, requestIds, locks = memoryLocks(), sess
   return { api: sandbox.__api, field, get requestIdCalls() { return requestIdCalls; } };
 }
 
-test("guest request uses the v4 canonical APT7 contract", () => {
+test("guest request uses the v5 canonical APT7 contract with stay dates", () => {
   for (const value of [
-    "action:'guest_request'", "schema_version:'4'", "property_code:'APT7'",
+    "action:'guest_request'", "schema_version:'5'", "property_code:'APT7'",
     "const INVOICE_SOURCE_SITE='apartman7.github.io'", "guest_name:", "address:",
     "company_id:", "tax_id:", "vat_id:", "guest_email:", "booking_id:",
-    "note:", "email_confirmed:", "electronic_delivery_consent:", "_honey:",
+    "check_in:", "check_out:", "note:", "email_confirmed:",
+    "electronic_delivery_consent:", "_honey:",
   ]) assert.ok(html.includes(value), `missing ${value}`);
+  assert.match(html, /id="invoiceSchemaVersion"[^>]*value="5"/);
   assert.doesNotMatch(html, /formsubmit\.co/i);
+});
+
+test("stay dates are required, translated, validated in order, and included in the payload", () => {
+  const checkIn = html.match(/<input\s+id="invoiceCheckIn"[^>]*>/)?.[0];
+  const checkOut = html.match(/<input\s+id="invoiceCheckOut"[^>]*>/)?.[0];
+  for (const [name, field] of [["arrival", checkIn], ["departure", checkOut]]) {
+    assert.ok(field, `missing ${name} date field`);
+    assert.match(field, /type="date"/);
+    assert.match(field, /\srequired(?:\s|=|>)/);
+    assert.match(field, /autocomplete="off"/);
+  }
+  assert.ok(html.includes("check_in:document.getElementById('invoiceCheckIn').value"));
+  assert.ok(html.includes("check_out:document.getElementById('invoiceCheckOut').value"));
+  assert.ok(html.includes("checkOut.min=checkIn.value||''"));
+  assert.ok(html.includes("checkOut.value<=checkIn.value"));
+  assert.ok(html.includes("checkOut.setCustomValidity(invalid?i18n[lang].stayDateError:'')"));
+  for (const translation of [
+    "Dátum odchodu musí byť po dátume príchodu.",
+    "Departure date must be after the arrival date.",
+    "Das Abreisedatum muss nach dem Anreisedatum liegen.",
+    "Дата виїзду має бути пізнішою за дату прибуття.",
+    "La fecha de salida debe ser posterior a la fecha de llegada.",
+    "A távozás dátumának az érkezés dátuma után kell lennie.",
+  ]) assert.ok(html.includes(translation), `missing translation: ${translation}`);
+
+  const submitStart = html.indexOf("async function submitInvoice(e)");
+  const validateIndex = html.indexOf("validateInvoiceStayDates()", submitStart);
+  const reportIndex = html.indexOf("reportValidity()", validateIndex);
+  const disableIndex = html.indexOf("b.disabled=true", submitStart);
+  const fingerprintIndex = html.indexOf("createInvoicePayloadFingerprint(data)", submitStart);
+  const requestIdIndex = html.indexOf("getOrCreateInvoiceRequestId(payloadFingerprint)", submitStart);
+  const postIndex = html.indexOf("postInvoiceRequest(data)", submitStart);
+  assert.ok(submitStart >= 0 && validateIndex > submitStart && reportIndex > validateIndex);
+  assert.ok(disableIndex > reportIndex && fingerprintIndex > reportIndex);
+  assert.ok(requestIdIndex > fingerprintIndex && postIndex > requestIdIndex);
 });
 
 test("Booking.com reservation number is visible, optional, and sent as digits only", () => {
@@ -128,9 +165,15 @@ test("close and reopen reuses the id, changed payload is isolated, and ACK retai
   ];
   const now = 1900000000000;
   const first = loadIdempotency({ localStorage, locks, requestIds: ids });
-  const payload = { guest_email: "host@example.com", guest_name: "Test", request_id: "" };
+  const payload = {
+    guest_email: "host@example.com", guest_name: "Test", check_in: "2026-08-01",
+    check_out: "2026-08-03", request_id: "",
+  };
   const fingerprint = await first.api.createInvoicePayloadFingerprint(payload);
-  const reordered = await first.api.createInvoicePayloadFingerprint({ ack_nonce: "ignored", request_id: "ignored", guest_name: "Test", guest_email: "host@example.com" });
+  const reordered = await first.api.createInvoicePayloadFingerprint({
+    ack_nonce: "ignored", request_id: "ignored", check_out: "2026-08-03",
+    guest_name: "Test", check_in: "2026-08-01", guest_email: "host@example.com",
+  });
   assert.equal(fingerprint, reordered, "volatile transport fields and key order must not change the fingerprint");
   const firstId = await first.api.getOrCreateInvoiceRequestId(fingerprint, now);
   assert.equal(firstId, ids[0]);
@@ -140,7 +183,8 @@ test("close and reopen reuses the id, changed payload is isolated, and ACK retai
   assert.equal(await reopened.api.getOrCreateInvoiceRequestId(fingerprint, now + 1), firstId);
   assert.equal(reopened.requestIdCalls, 0, "reopened page must not generate another id");
 
-  const changedFingerprint = await reopened.api.createInvoicePayloadFingerprint({ ...payload, guest_name: "Changed" });
+  const changedFingerprint = await reopened.api.createInvoicePayloadFingerprint({ ...payload, check_out: "2026-08-04" });
+  assert.notEqual(changedFingerprint, fingerprint, "changing a stay date must change the fingerprint");
   const changedId = await reopened.api.getOrCreateInvoiceRequestId(changedFingerprint, now + 2);
   assert.equal(changedId, ids[1]);
   assert.ok(localStorage.getItem(reopened.api.pendingInvoiceStorageKey_(fingerprint)));
