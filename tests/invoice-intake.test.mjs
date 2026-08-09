@@ -86,6 +86,16 @@ test("guest request uses the v4 canonical APT7 contract", () => {
   assert.doesNotMatch(html, /formsubmit\.co/i);
 });
 
+test("Booking.com reservation number is visible, optional, and sent as digits only", () => {
+  const field = html.match(/<input\s+id="invoiceBookingId"[^>]*>/)?.[0];
+  assert.ok(field, "missing visible Booking.com reservation number field");
+  assert.match(field, /inputmode="numeric"/);
+  assert.match(field, /pattern="\[0-9\]\{6,20\}"/);
+  assert.match(field, /maxlength="24"/);
+  assert.doesNotMatch(field, /\srequired(?:\s|=|>)/);
+  assert.ok(html.includes("booking_id:document.getElementById('invoiceBookingId').value.replace(/\\D/g,'')"));
+});
+
 test("iframe transport accepts only a matching Google ACK", () => {
   for (const value of [
     "https://script.google.com/macros/s/AKfycbwD7RRz5nJdp6FsU3vL1CTgsPNwXPuCrx1ad9JMBa8LQNDYZCTltMAtN48IRzb8NsYo/exec", "booking-invoice-intake-v1",
